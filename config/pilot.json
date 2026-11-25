@@ -1,0 +1,16 @@
+{
+  "capacity_reserve_percent": 5,
+  "slow_stock_days": 30,
+  "demo_routing": {
+    "shelf_unit_kopecks": 7000,
+    "direct_base_unit_kopecks": 7000,
+    "direct_trip_kopecks": 90000,
+    "direct_total_individual_delay_kopecks": 2000,
+    "hub_unit_kopecks": 17200,
+    "retained_hub_unit_kopecks": 0,
+    "trip_orders": 10,
+    "shelf_minutes": 30,
+    "direct_minutes": 120,
+    "hub_minutes": 1440
+  }
+}
