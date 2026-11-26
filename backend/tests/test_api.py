@@ -5,11 +5,13 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
 
 from backend.app.config import load_config
 from backend.app.contracts import utc_now
-from backend.app.integrations import DemoRouting
+from backend.app.integrations import PilotRouting
 from backend.app.main import create_app
+from backend.app.routing.models import DirectTrip, PickupPoint, Window
 
 
 def register_points(client, capacity=1000):
@@ -99,7 +101,11 @@ def test_direct_full_flow_and_repeat_scan(api):
     done = act(api, order, "issue", "B")
     assert done["status"] == "delivered"
     assert {action["type"] for action in done["next_actions"]} == {"return_good", "return_damaged"}
-    assert done["pricing_pending"] and done["accruals"] == []
+    assert not done["pricing_pending"]
+    assert done["accrual_total_kopecks"] == 4500
+    assert [(entry["point_id"], entry["amount_kopecks"]) for entry in done["accruals"]] == [
+        ("A", 1500), ("A", 500), ("B", 500), ("B", 2000),
+    ]
     assert [event["type"] for event in done["operations"]] == [
         "order_created", "pack", "handoff", "update_transit", "receive", "issue",
     ]
@@ -218,7 +224,7 @@ def test_receiving_rechecks_capacity_after_handoff(api):
     (10, 21_400, 5_200, "hub"),
     (10, 17_200, 1_000, "hub"),
 ])
-def test_demo_routing_rates(tmp_path, trip_orders, cost, retained, route):
+def test_integrated_routing_rates(tmp_path, trip_orders, cost, retained, route):
     config = load_config()
     config.demo_routing.trip_orders = trip_orders
     config.demo_routing.retained_hub_unit_kopecks = retained
@@ -235,7 +241,7 @@ def test_last_unit_concurrency_recalculates(tmp_path):
     config = load_config()
     barrier = Barrier(2, timeout=5)
 
-    class SynchronizedRouter(DemoRouting):
+    class SynchronizedRouter(PilotRouting):
         calls = 0
         lock = Lock()
 
@@ -247,7 +253,7 @@ def test_last_unit_concurrency_recalculates(tmp_path):
                 barrier.wait()
             return super().choose(request)
 
-    router = SynchronizedRouter(config.demo_routing)
+    router = SynchronizedRouter(config.demo_routing, config.logistics_pricing)
     with TestClient(create_app(str(tmp_path / "race.sqlite3"), config=config, routing=router)) as client:
         register_points(client)
         receive(client, quantity=1)
@@ -261,3 +267,174 @@ def test_last_unit_concurrency_recalculates(tmp_path):
         assert router.calls == 3
         replay = client.post("/api/orders", json=payloads[0])
         assert replay.json()["id"] == responses[0].json()["id"]
+
+
+@pytest.fixture
+def scheduled():
+    config = load_config()
+    now = utc_now()
+    window = Window(
+        window_id="work", start=now - timedelta(minutes=5), end=now + timedelta(hours=5), free_units=10,
+    )
+    for point in ("A", "B", "C"):
+        config.demo_routing.points[point] = PickupPoint(
+            pvz_id=point, city_id="city", pack_minutes=10, load_minutes=5, receive_minutes=5,
+            pack_windows=(window,), load_windows=(window,), receive_windows=(window,),
+        )
+    config.demo_routing.direct_trips = [DirectTrip(
+        trip_id="A-B-1", source_id="A", pickup_pvz_id="B", departure_at=now + timedelta(hours=1),
+        travel_minutes=30, loaded_orders=10, free_units=1, trip_kopecks=92000,
+    )]
+    return config
+
+
+def test_closed_receiving_window_explains_hub(scheduled, tmp_path):
+    schedule = scheduled.demo_routing
+    schedule.points["B"] = schedule.points["B"].model_copy(update={"receive_windows": ()})
+    with TestClient(create_app(str(tmp_path / "closed.sqlite3"), config=scheduled)) as client:
+        register_points(client)
+        receive(client)
+        route = create(client)["route"]
+        assert (route["route_type"], route["reason_code"]) == ("hub", "direct_windows_unavailable")
+        planned = next(entry for entry in route["evaluations"] if entry["trip_id"] == "A-B-1")
+        assert planned["reason_code"] == "direct_receive_window"
+
+
+def test_concurrent_trip_capacity_and_release(scheduled, tmp_path):
+    with TestClient(create_app(str(tmp_path / "trip.sqlite3"), config=scheduled)) as client:
+        register_points(client)
+        receive(client)
+        with ThreadPoolExecutor(2) as pool:
+            orders = list(pool.map(lambda _: create(client), range(2)))
+        direct, hub = sorted(orders, key=lambda order: order["route"]["route_type"])
+        assert direct["route"]["trip_id"] == "A-B-1"
+        assert hub["route"]["route_type"] == "hub"
+        assert any(row["reason_code"] == "direct_no_capacity" for row in hub["route"]["evaluations"])
+        assert len(direct["route"]["milestones"]) == 5
+        act(client, direct, "cancel", "A")
+        assert create(client)["route"]["trip_id"] == "A-B-1"
+
+
+def test_receive_window_is_shared_across_trips_and_released(scheduled, tmp_path):
+    schedule = scheduled.demo_routing
+    target = schedule.points["B"]
+    schedule.points["B"] = target.model_copy(update={
+        "receive_windows": (target.receive_windows[0].model_copy(update={"free_units": 1}),),
+    })
+    schedule.direct_trips.append(schedule.direct_trips[0].model_copy(update={
+        "trip_id": "C-B-1", "source_id": "C",
+    }))
+    with TestClient(create_app(str(tmp_path / "window.sqlite3"), config=scheduled)) as client:
+        register_points(client)
+        receive(client)
+        receive(client, "C", batch_id="lot-c")
+        first = create(client)
+        assert first["route"]["trip_id"] == "A-B-1"
+        second = create(client)
+        assert second["route"]["route_type"] == "hub"
+        assert any(entry["reason_code"] == "direct_receive_window" for entry in second["route"]["evaluations"])
+        replanned = act(client, first, "replan", "A", reason="окно погрузки сорвалось")
+        assert replanned["route"]["trip_id"] == "C-B-1"
+        assert replanned["route"]["replan_cause"] == "окно погрузки сорвалось"
+
+
+def test_pending_inbound_reserves_physical_capacity(api):
+    receive(api)
+    receive(api, "B", 8, batch_id="filler", sku="OTHER")
+    first = create(api)
+    response = api.post("/api/orders", json=order_payload(wb_club=False))
+    assert response.status_code == 409
+    assert response.json()["detail"]["reason_code"] == "hub_no_stock"
+    act(api, first, "cancel", "A")
+    assert create(api, wb_club=False)["route"]["route_type"] == "hub"
+
+
+def test_transit_uses_observation_and_keeps_cargo_in_transit(scheduled, tmp_path):
+    with TestClient(create_app(str(tmp_path / "travel.sqlite3"), config=scheduled)) as client:
+        register_points(client)
+        receive(client)
+        order = create(client)
+        act(client, order, "pack", "A")
+        act(client, order, "handoff", "A")
+        lost = act(client, order, "update_transit", "A", actual_position="на трассе", remaining_travel_minutes=400)
+        assert lost["route"]["reason_code"] == "receive_window_missing"
+        assert lost["route"]["ready_at"] is None
+        assert act(client, order, "receive", "B", 409)["detail"]["code"] == "route_window_unavailable"
+        assert stock(client, "A")["in_transit"] == 1
+        arrived = act(client, order, "update_transit", "A", actual_position="B", remaining_travel_minutes=0)
+        route = arrived["route"]
+        assert route["trip_id"] == "A-B-1" and route["meets_deadline"]
+        assert route["arrival_at"] == arrived["operations"][-1]["details"]["arrival_at"]
+        assert route["milestones"][-1]["stage"] == "receive"
+        assert act(client, order, "receive", "B")["status"] == "ready"
+
+
+def test_storage_and_issue_accrue_only_once(api):
+    receive(api)
+    storage_path = "/api/inventory/A/lot/storage"
+    payload = {"request_id": "storage-today", "quantity": 3}
+    confirmed = api.post(storage_path, json=payload)
+    assert confirmed.status_code == 201
+    assert api.post(storage_path, json=payload).json() == confirmed.json()
+    duplicate = api.post(storage_path, json={**payload, "request_id": "storage-other-key"})
+    assert duplicate.json()["detail"]["code"] == "storage_already_confirmed"
+    ledger = api.get("/api/accruals", params={"point_id": "A", "batch_id": "lot"}).json()
+    assert ledger["total_kopecks"] == 1200
+    assert {item["reason"] for item in ledger["items"]} == {"intake", "storage"}
+
+    order = create(api, "A")
+    act(api, order, "pack", "A")
+    act(api, order, "issue", "A", request_id="same-scan")
+    replay = act(api, order, "issue", "A", request_id="same-scan")
+    assert replay["accrual_total_kopecks"] == 3500
+    assert len(api.get("/api/accruals", params={"order_id": order["id"]}).json()["items"]) == 2
+    assert act(api, order, "issue", "A", 409)["detail"]["code"] == "invalid_order_status"
+    assert stock(api, "A")["available"] == 2
+
+
+def test_ledger_upgrades_existing_events_without_repricing(tmp_path):
+    path = str(tmp_path / "existing.sqlite3")
+    with TestClient(create_app(path)) as client:
+        register_points(client)
+        receive(client)
+        order = create(client, "A")
+        act(client, order, "pack", "A", request_id="stored-pack")
+    engine = create_engine(f"sqlite:///{path}")
+    with engine.begin() as connection:
+        # V1 had the operation log and orders, but no ledger or route reservations.
+        connection.execute(text("DROP TABLE logistics_accruals"))
+        connection.execute(text("DROP TABLE route_reservations"))
+        connection.execute(text(
+            "UPDATE orders SET route = json_remove(route, '$.reason_code', '$.milestones', '$.evaluations')"
+        ))
+    engine.dispose()
+    with TestClient(create_app(path)) as client:
+        assert client.get("/api/accruals").json()["total_kopecks"] == 2400
+        assert act(client, order, "pack", "A", request_id="stored-pack")["accrual_total_kopecks"] == 1500
+        assert act(client, order, "issue", "A")["accrual_total_kopecks"] == 3500
+    config = load_config()
+    rate = config.logistics_pricing.operation_rates["issue"]
+    config.logistics_pricing.operation_rates["issue"] = rate.model_copy(update={"per_unit_kopecks": 3000})
+    with TestClient(create_app(path, config=config)) as client:
+        assert client.get("/api/accruals").json()["total_kopecks"] == 4400
+
+
+def test_accrual_and_stock_roll_back_together(api, monkeypatch):
+    from backend.app.pricing import ledger
+
+    receive(api)
+    order = create(api, "A")
+    act(api, order, "pack", "A")
+    record = ledger.record_accrual
+
+    def fail_after_insert(*args):
+        record(*args)
+        raise RuntimeError("test transaction failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ledger, "record_accrual", fail_after_insert)
+        with pytest.raises(RuntimeError, match="test transaction failure"):
+            act(api, order, "issue", "A", request_id="retry-issue")
+    assert stock(api, "A")["ready"] == 1
+    assert api.get(f"/api/orders/{order['id']}").json()["accrual_total_kopecks"] == 1500
+    assert act(api, order, "issue", "A", request_id="retry-issue")["accrual_total_kopecks"] == 3500

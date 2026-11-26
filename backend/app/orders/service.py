@@ -1,8 +1,9 @@
 from datetime import datetime
+from math import ceil
 from uuid import uuid4
 
-from pydantic import AwareDatetime
-from sqlalchemy import func, select
+from pydantic import AwareDatetime, Field
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from ..config import PilotConfig
@@ -11,10 +12,13 @@ from ..contracts import (
     Quantity, RouteDecision, RoutingRequest, RoutingStock, TransitRequest, utc_now,
 )
 from ..db import Database
-from ..integrations import NoRoute, PricingGateway, RoutingGateway
+from ..integrations import NoRoute, PilotRouting
 from ..inventory.service import get_point, get_product, point_view, require_space, stock_at
-from ..models import Allocation, Batch, Order, Stock
+from ..models import Allocation, Batch, Order, Product, Stock
 from ..operations import OperationLog, read_events, reject
+from ..pricing.ledger import PricingLedger
+from ..routing.models import RouteMilestone
+from . import reservations
 
 
 class OrderCommand(Command):
@@ -25,6 +29,7 @@ class OrderCommand(Command):
     shortage_batch_id: Code | None = None
     reason: Code | None = None
     actual_position: Code | None = None
+    remaining_travel_minutes: int | None = Field(default=None, ge=0, le=525_600, strict=True)
 
 
 class NextAction(APIModel):
@@ -55,6 +60,7 @@ class OrderView(APIModel):
     allocations: list[BatchAllocation]
     operations: list[OperationEvent]
     accruals: list[Accrual]
+    accrual_total_kopecks: int
     pricing_pending: bool
 
 
@@ -84,15 +90,16 @@ def action_points(order: Order) -> dict[Action, str]:
 
 class Orders:
     def __init__(
-        self, db: Database, pilot: PilotConfig, routing: RoutingGateway, pricing: PricingGateway,
+        self, db: Database, pilot: PilotConfig, routing: PilotRouting, ledger: PricingLedger,
     ):
         self.db = db
         self.reserve_percent = pilot.capacity_reserve_percent
         self.routing = routing
-        self.pricing = pricing
+        self.ledger = ledger
 
     def view(self, session: Session, order: Order) -> OrderView:
         events = read_events(session, order_id=order.id)
+        accruals = self.ledger.list(session, order_id=order.id)
         return OrderView(
             id=order.id, scan_code=order.scan_code, sku=order.sku, quantity=order.quantity,
             wb_club=order.wb_club, pickup_point_id=order.pickup_point_id,
@@ -101,11 +108,12 @@ class Orders:
             route_failure=order.route_failure, actual_position=order.actual_position,
             next_actions=[NextAction(type=kind, point_id=point) for kind, point in action_points(order).items()],
             allocations=[BatchAllocation.model_validate(item) for item in self.allocations(session, order)],
-            operations=events, accruals=self.pricing.accruals(events), pricing_pending=self.pricing.pending,
+            operations=events, accruals=accruals, pricing_pending=False,
+            accrual_total_kopecks=sum(entry.amount_kopecks for entry in accruals),
         )
 
     def routing_request(
-        self, session: Session, order: Order, excluded: list[str] | None = None,
+        self, session: Session, order: Order,
     ) -> RoutingRequest:
         pickup = get_point(session, order.pickup_point_id)
         product = get_product(session, order.sku)
@@ -114,14 +122,29 @@ class Orders:
             .join_from(Stock, Batch).where(Batch.sku == order.sku, Stock.available > 0)
             .group_by(Stock.point_id).order_by(Stock.point_id)
         )
+        now = utc_now()
         return RoutingRequest(
             sku=order.sku, quantity=order.quantity, unit_volume_cm3=product.unit_volume_cm3,
-            wb_club=order.wb_club, pickup_point_id=pickup.id, requested_at=utc_now(),
+            wb_club=order.wb_club, pickup_point_id=pickup.id, requested_at=now,
             promised_by=order.promised_by,
-            pickup_free_volume_cm3=point_view(session, pickup, self.reserve_percent).free_volume_cm3,
+            pickup_free_volume_cm3=self.destination_space(session, order),
             stock=[RoutingStock(point_id=point_id, available=quantity) for point_id, quantity in balances],
-            excluded_source_ids=excluded or [],
+            resource_usage=reservations.resource_usage(session, now),
         )
+
+    def destination_space(self, session: Session, order: Order) -> int:
+        pickup = get_point(session, order.pickup_point_id)
+        physical = point_view(session, pickup, self.reserve_percent).free_volume_cm3
+        inbound = session.scalar(
+            select(func.coalesce(func.sum(Order.quantity * Product.unit_volume_cm3), 0))
+            .join_from(Order, Product, Order.sku == Product.sku)
+            .where(
+                Order.pickup_point_id == pickup.id, Order.id != order.id,
+                Order.status.in_(("reserved", "packed", "in_transit", "awaiting_hub")),
+                or_(Order.source_point_id.is_(None), Order.source_point_id != pickup.id),
+            )
+        )
+        return max(0, physical - inbound)
 
     def assign(self, session: Session, order: Order, request: RoutingRequest, route: RouteDecision) -> None:
         source = route.source_point_id
@@ -133,7 +156,7 @@ class Orders:
         )
         if (
             not valid_source or route.pickup_point_id != pickup
-            or not request.requested_at <= route.ready_at <= request.promised_by
+            or route.ready_at is None or not request.requested_at <= route.ready_at <= request.promised_by
         ):
             reject("invalid_route", "Модуль маршрутизации вернул несовместимый маршрут", 502)
         if route.route_type != "shelf":
@@ -160,6 +183,8 @@ class Orders:
         order.source_point_id = source
         order.route_failure = None
         order.status = "awaiting_hub" if route.route_type == "hub" else "reserved"
+        for resource in route.resources:
+            reservations.reserve(session, order, resource)
 
     def create(self, command: OrderRequest) -> OrderView:
         order_id = uuid4().hex
@@ -178,7 +203,7 @@ class Orders:
             decision = self.routing.choose(snapshot)
             failure = None
         except NoRoute as error:
-            decision, failure = None, str(error)
+            decision, failure = None, error
 
         with self.db.transaction(write=True) as session:
             log = OperationLog(session, "create_order", command)
@@ -186,17 +211,20 @@ class Orders:
             if replay:
                 return self.view(session, get_order(session, replay.order_id))
             current = self.routing_request(session, order)
-            # If another order changed stock or capacity during planning, recalculate under the lock.
+            # Replan on concurrent inventory, window or trip changes, or an expired plan.
             if (
                 snapshot.model_copy(update={"requested_at": current.requested_at}) != current
-                or (decision is not None and decision.ready_at < current.requested_at)
+                or (decision is not None and (
+                    decision.ready_at < current.requested_at
+                    or any(resource.expires_at <= current.requested_at for resource in decision.resources)
+                ))
             ):
                 try:
                     decision, failure = self.routing.choose(current), None
                 except NoRoute as error:
-                    decision, failure = None, str(error)
+                    decision, failure = None, error
             if decision is None:
-                reject("no_route", failure)
+                reject("no_route", str(failure), reason_code=failure.reason_code)
             session.add(order)
             session.flush()
             self.assign(session, order, current, decision)
@@ -231,8 +259,14 @@ class Orders:
         session.flush()
         return blocked_lots
 
-    def replan(self, session: Session, order: Order, excluded: list[str]) -> None:
-        request = self.routing_request(session, order, excluded)
+    def replan(
+        self, session: Session, order: Order, cause: str, excluded: list[str], skip_trip: str | None,
+    ) -> str | None:
+        request = self.routing_request(session, order).model_copy(update={
+            "replan_cause": cause,
+            "excluded_source_ids": excluded,
+            "excluded_trip_ids": [skip_trip] if skip_trip else [],
+        })
         try:
             route = self.routing.choose(request)
         except NoRoute as error:
@@ -240,8 +274,56 @@ class Orders:
             order.source_point_id = None
             order.status = "awaiting_route"
             order.route_failure = str(error)
+            return error.reason_code
         else:
             self.assign(session, order, request, route)
+            return None
+
+    def update_transit(self, session: Session, order: Order, command: OrderCommand) -> dict:
+        if command.actual_position is None:
+            reject("position_required", "Укажите фактическое положение посылки", 422)
+        observed_at = utc_now()
+        old_route = RouteDecision.model_validate(order.route)
+        remaining = command.remaining_travel_minutes
+        if remaining is None:
+            arrival = old_route.arrival_at or next(
+                (step.ends_at for step in old_route.milestones if step.stage == "arrival"), None,
+            )
+            if command.actual_position == order.pickup_point_id:
+                remaining = 0
+            elif arrival is None:
+                remaining = self.routing.schedule.travel_minutes
+            else:
+                remaining = max(0, ceil((arrival - observed_at).total_seconds() / 60))
+        reservations.release_pending(session, order, "receive")
+        product = get_product(session, order.sku)
+        free_volume = self.destination_space(session, order)
+        estimate = self.routing.estimate_transit(TransitRequest(
+            order_id=order.id, pickup_point_id=order.pickup_point_id, actual_position=command.actual_position,
+            observed_at=observed_at, promised_by=order.promised_by, quantity=order.quantity,
+            pickup_free_units=free_volume // product.unit_volume_cm3, remaining_travel_minutes=remaining,
+            resource_usage=reservations.resource_usage(session, observed_at),
+        ))
+        if estimate.resource is not None:
+            reservations.reserve(session, order, estimate.resource)
+        milestones = [step for step in old_route.milestones if step.stage not in {"arrival", "receive"}]
+        milestones.append(RouteMilestone(
+            stage="arrival", starts_at=estimate.arrival_at, ends_at=estimate.arrival_at,
+            pvz_id=order.pickup_point_id,
+        ))
+        if estimate.receiving_slot is not None:
+            milestones.append(estimate.receiving_slot)
+        order.route = old_route.model_copy(update={
+            "ready_at": estimate.ready_at, "reason": estimate.reason, "reason_code": estimate.reason_code,
+            "arrival_at": estimate.arrival_at, "meets_deadline": estimate.meets_deadline,
+            "milestones": tuple(milestones),
+        }).model_dump(mode="json")
+        order.actual_position = command.actual_position
+        return {
+            "actual_position": order.actual_position, "remaining_travel_minutes": remaining,
+            "arrival_at": order.route["arrival_at"], "ready_at": order.route["ready_at"],
+            "reason_code": estimate.reason_code,
+        }
 
     @staticmethod
     def allocations(session: Session, order: Order) -> list[Allocation]:
@@ -264,7 +346,9 @@ class Orders:
 
     def apply(self, session: Session, order_id: str, command: OrderCommand) -> OrderView:
         order = get_order(session, order_id)
-        log = OperationLog(session, f"order/{order_id}", command)
+        log = OperationLog(
+            session, f"order/{order_id}", command, self.ledger, omit_if_none=("remaining_travel_minutes",),
+        )
         if log.replay():
             return self.view(session, order)
         if command.scan_code != order.scan_code:
@@ -278,7 +362,7 @@ class Orders:
             reject("wrong_point", "Операцию нужно выполнить в другом ПВЗ")
         if (command.shortage_quantity is not None or command.shortage_batch_id is not None) and kind != "shortage":
             reject("unexpected_shortage", "Количество недостачи указывается только для недостачи", 422)
-        if command.actual_position is not None and kind != "update_transit":
+        if (command.actual_position is not None or command.remaining_travel_minutes is not None) and kind != "update_transit":
             reject("unexpected_position", "Позиция указывается только при обновлении перевозки", 422)
 
         source = order.source_point_id
@@ -287,12 +371,14 @@ class Orders:
         batch_id = None
         quantity = order.quantity
         if kind == "pack":
+            reservations.consume(session, order, "pack")
             if order.route["route_type"] == "shelf":
                 self.move_allocations(session, order, point, "reserved", point, "ready")
                 order.status = "ready"
             else:
                 order.status = "packed"
         elif kind == "handoff":
+            reservations.consume(session, order, "load", "departure")
             self.move_allocations(session, order, point, "reserved", point, "in_transit")
             order.actual_position = point
             order.status = "in_transit"
@@ -309,6 +395,9 @@ class Orders:
                 stock_at(session, batch_id, point).ready = order.quantity
                 session.add(Allocation(order_id=order.id, batch_id=batch_id, quantity=order.quantity))
             elif kind == "receive":
+                if order.route["ready_at"] is None:
+                    reject("route_window_unavailable", "Нет подходящего окна приёмки, обновите положение посылки")
+                reservations.consume(session, order, "receive")
                 self.move_allocations(session, order, source, "in_transit", pickup, "ready")
             else:
                 bucket = "available" if kind == "return_good" else "damaged"
@@ -321,6 +410,7 @@ class Orders:
             order.status = "delivered"
         elif kind == "cancel":
             self.release(session, order, 0)
+            reservations.release_pending(session, order)
             order.status = "cancelled"
         elif kind in {"shortage", "replan"}:
             disputed = (command.shortage_quantity or order.quantity) if kind == "shortage" else 0
@@ -332,19 +422,14 @@ class Orders:
             if kind == "shortage":
                 quantity = disputed
                 details["blocked_lots"] = [lot.model_dump() for lot in blocked]
-            self.replan(session, order, [source] if source else [])
-            details.update(route=order.route, route_failure=order.route_failure)
+            reservations.release_pending(session, order)
+            cause = command.reason or ("недостача товара" if kind == "shortage" else "сбой до отправки")
+            trip_id = order.route.get("trip_id") if order.route and kind == "replan" else None
+            excluded = [source] if source and (kind == "shortage" or trip_id is None) else []
+            failure_code = self.replan(session, order, cause, excluded, trip_id)
+            details.update(route=order.route, route_failure=order.route_failure, reason_code=failure_code)
         elif kind == "update_transit":
-            if command.actual_position is None:
-                reject("position_required", "Укажите фактическое положение посылки", 422)
-            estimate = self.routing.estimate_transit(TransitRequest(
-                order_id=order.id, pickup_point_id=pickup, actual_position=command.actual_position,
-                observed_at=utc_now(), previous_ready_at=order.route["ready_at"],
-                promised_by=order.promised_by,
-            ))
-            order.route = {**order.route, "ready_at": estimate.ready_at.isoformat(), "reason": estimate.reason}
-            order.actual_position = command.actual_position
-            details.update(actual_position=order.actual_position, ready_at=order.route["ready_at"])
+            details.update(self.update_transit(session, order, command))
         log.record(
             kind, point, order.sku, quantity, order_id=order.id, batch_id=batch_id, details=details,
         )

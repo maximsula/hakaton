@@ -76,6 +76,19 @@ class Allocation(Base):
     quantity: Mapped[int]
 
 
+class RouteReservation(Base):
+    __tablename__ = "route_reservations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[str] = mapped_column(ForeignKey("orders.id"), index=True)
+    stage: Mapped[str]
+    resource_key: Mapped[str] = mapped_column(index=True)
+    expires_at: Mapped[str] = mapped_column(index=True)
+    quantity: Mapped[int]
+    order_index: Mapped[int | None]
+    consumed: Mapped[bool] = mapped_column(default=False)
+
+
 class Operation(Base):
     __tablename__ = "operations"
 

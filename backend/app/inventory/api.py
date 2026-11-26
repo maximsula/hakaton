@@ -2,17 +2,19 @@ from fastapi import APIRouter
 from sqlalchemy import select
 
 from ..config import PilotConfig
-from ..contracts import Code
+from ..contracts import Code, OperationEvent
 from ..db import Database
 from ..models import Point, Product
 from ..operations import reject
+from ..pricing.ledger import PricingLedger
 from .service import (
     BatchView, PointInput, PointView, ProductInput, ProductView, Receipt, StockCommand, StockView,
-    change_stock, list_stock, point_view, receive_batch, register_product,
+    StorageConfirmation, change_stock, confirm_storage, list_stock, point_view, receive_batch,
+    register_product,
 )
 
 
-def inventory_router(db: Database, pilot: PilotConfig) -> APIRouter:
+def inventory_router(db: Database, pilot: PilotConfig, ledger: PricingLedger) -> APIRouter:
     router = APIRouter(prefix="/api", tags=["Остатки и поставки"])
     reserve = pilot.capacity_reserve_percent
 
@@ -46,7 +48,7 @@ def inventory_router(db: Database, pilot: PilotConfig) -> APIRouter:
     @router.post("/batches", status_code=201)
     def post_batch(command: Receipt) -> BatchView:
         with db.transaction(write=True) as session:
-            return receive_batch(session, command, reserve)
+            return receive_batch(session, command, reserve, ledger)
 
     @router.get("/inventory")
     def get_inventory(
@@ -62,5 +64,10 @@ def inventory_router(db: Database, pilot: PilotConfig) -> APIRouter:
                 session, point_id, batch_id, command,
                 reserve_percent=reserve, slow_days=pilot.slow_stock_days,
             )
+
+    @router.post("/inventory/{point_id}/{batch_id}/storage", status_code=201)
+    def post_storage(point_id: Code, batch_id: Code, command: StorageConfirmation) -> OperationEvent:
+        with db.transaction(write=True) as session:
+            return confirm_storage(session, point_id, batch_id, command, ledger)
 
     return router

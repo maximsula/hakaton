@@ -5,9 +5,10 @@ from pydantic import AwareDatetime
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..contracts import APIModel, Code, Command, Quantity, Volume, utc_now
-from ..models import Batch, Point, Product, Stock
+from ..contracts import APIModel, Code, Command, OperationEvent, Quantity, Volume, utc_now
+from ..models import Batch, Operation, Point, Product, Stock
 from ..operations import OperationLog, reject
+from ..pricing.ledger import PricingLedger
 
 
 class PointInput(APIModel):
@@ -63,6 +64,10 @@ class StockCommand(Command):
     destination_point_id: Code | None = None
 
 
+class StorageConfirmation(Command):
+    quantity: Quantity
+
+
 def get_point(session: Session, point_id: str) -> Point:
     point = session.get(Point, point_id)
     if point is None:
@@ -116,8 +121,10 @@ def stock_at(session: Session, batch_id: str, point_id: str) -> Stock:
     return stock
 
 
-def receive_batch(session: Session, command: Receipt, reserve_percent: int) -> BatchView:
-    log = OperationLog(session, "receipt", command)
+def receive_batch(
+    session: Session, command: Receipt, reserve_percent: int, ledger: PricingLedger,
+) -> BatchView:
+    log = OperationLog(session, "receipt", command, ledger)
     replay = log.replay()
     if replay:
         return BatchView(**command.model_dump(), simulated=False)
@@ -138,6 +145,30 @@ def receive_batch(session: Session, command: Receipt, reserve_percent: int) -> B
     stock_at(session, command.batch_id, command.point_id).available = command.quantity
     log.record("batch_received", command.point_id, command.sku, command.quantity, batch_id=command.batch_id)
     return BatchView(**command.model_dump(), simulated=False)
+
+
+def confirm_storage(
+    session: Session, point_id: str, batch_id: str, command: StorageConfirmation, ledger: PricingLedger,
+) -> OperationEvent:
+    log = OperationLog(session, f"storage/{point_id}/{batch_id}", command, ledger)
+    if replay := log.replay():
+        return OperationEvent.model_validate(replay.payload)
+    stock = session.get(Stock, (batch_id, point_id))
+    if stock is None:
+        reject("stock_not_found", "Партия в этом ПВЗ не найдена", 404)
+    day = utc_now().date().isoformat()
+    existing = session.scalar(select(Operation.event_id).where(
+        Operation.point_id == point_id, Operation.batch_id == batch_id,
+        Operation.payload["type"].as_string() == "storage",
+        Operation.payload["details"]["storage_date"].as_string() == day,
+    ))
+    if existing is not None:
+        reject("storage_already_confirmed", "Хранение этой партии в ПВЗ сегодня уже подтверждено")
+    if command.quantity > stock.available + stock.reserved + stock.ready:
+        reject("insufficient_stock", "Подтверждённое количество превышает товар на полке")
+    batch = session.get(Batch, batch_id)
+    return log.record("storage", point_id, batch.sku, command.quantity, batch_id=batch_id,
+                      details={"storage_date": day})
 
 
 def storage_days(batch: Batch) -> int:

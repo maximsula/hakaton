@@ -2,15 +2,32 @@
   "capacity_reserve_percent": 5,
   "slow_stock_days": 30,
   "demo_routing": {
-    "shelf_unit_kopecks": 7000,
-    "direct_base_unit_kopecks": 7000,
     "direct_trip_kopecks": 90000,
     "direct_total_individual_delay_kopecks": 2000,
-    "hub_unit_kopecks": 17200,
     "retained_hub_unit_kopecks": 0,
     "trip_orders": 10,
+    "trip_capacity_units": 100,
+    "window_capacity_units": 100,
     "shelf_minutes": 30,
+    "load_minutes": 10,
+    "receive_minutes": 10,
     "direct_minutes": 120,
-    "hub_minutes": 1440
+    "hub_minutes": 1440,
+    "departure_interval_minutes": 30
+  },
+  "logistics_pricing": {
+    "shelf_per_order_kopecks": 7000,
+    "direct_per_order_kopecks": 7000,
+    "hub_per_order_kopecks": 17200,
+    "allow_direct_without_eligible_hub": true,
+    "operation_rates": {
+      "intake": {"payer_id": "wb", "recipient_id": "$pvz", "per_unit_kopecks": 300},
+      "storage": {"payer_id": "wb", "recipient_id": "$pvz", "per_unit_kopecks": 100},
+      "pack": {"payer_id": "wb", "recipient_id": "$pvz", "per_unit_kopecks": 1500},
+      "handover": {"payer_id": "wb", "recipient_id": "$pvz", "per_unit_kopecks": 500},
+      "transfer_receive": {"payer_id": "wb", "recipient_id": "$pvz", "per_unit_kopecks": 500},
+      "issue": {"payer_id": "wb", "recipient_id": "$pvz", "per_unit_kopecks": 2000},
+      "return": {"payer_id": "wb", "recipient_id": "$pvz", "per_unit_kopecks": 1000}
+    }
   }
 }

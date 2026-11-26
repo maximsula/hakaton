@@ -3,6 +3,9 @@ from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints
 
+from .pricing.costs import CostBreakdown
+from .routing.models import CandidateEvaluation, RouteMilestone
+
 Code = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
 Quantity = Annotated[int, Field(gt=0, le=1_000_000, strict=True)]
 Volume = Annotated[int, Field(gt=0, le=1_000_000_000, strict=True)]
@@ -42,6 +45,18 @@ class RoutingStock(APIModel):
     available: int
 
 
+class ResourceUsage(APIModel):
+    quantity: int = 0
+    order_indices: list[int] = Field(default_factory=list)
+
+
+class RouteResource(APIModel):
+    key: str
+    stage: Literal["pack", "load", "departure", "receive"]
+    expires_at: AwareDatetime
+    order_index: int | None = None
+
+
 class RoutingRequest(APIModel):
     sku: Code
     quantity: Quantity
@@ -53,6 +68,9 @@ class RoutingRequest(APIModel):
     requested_at: AwareDatetime
     stock: list[RoutingStock]
     excluded_source_ids: list[Code] = Field(default_factory=list)
+    excluded_trip_ids: list[str] = Field(default_factory=list)
+    replan_cause: str | None = None
+    resource_usage: dict[str, ResourceUsage] = Field(default_factory=dict)
 
 
 class RouteOption(APIModel):
@@ -63,9 +81,20 @@ class RouteOption(APIModel):
 
 
 class RouteDecision(RouteOption):
+    ready_at: AwareDatetime | None
     pickup_point_id: Code
     reason: str
     alternatives: list[RouteOption] = Field(default_factory=list)
+    reason_code: str | None = None
+    trip_id: str | None = None
+    hub_source_id: str | None = None
+    cost_breakdown: CostBreakdown | None = None
+    milestones: tuple[RouteMilestone, ...] = ()
+    evaluations: tuple[CandidateEvaluation, ...] = ()
+    replan_cause: str | None = None
+    arrival_at: AwareDatetime | None = None
+    meets_deadline: bool | None = None
+    resources: list[RouteResource] = Field(default_factory=list, exclude=True)
 
 
 class TransitRequest(APIModel):
@@ -73,13 +102,21 @@ class TransitRequest(APIModel):
     pickup_point_id: Code
     actual_position: Code
     observed_at: AwareDatetime
-    previous_ready_at: AwareDatetime
     promised_by: AwareDatetime
+    quantity: Quantity
+    pickup_free_units: int
+    remaining_travel_minutes: int
+    resource_usage: dict[str, ResourceUsage]
 
 
 class TransitEstimate(APIModel):
-    ready_at: AwareDatetime
+    ready_at: AwareDatetime | None
+    arrival_at: AwareDatetime
+    meets_deadline: bool
     reason: str
+    reason_code: str
+    receiving_slot: RouteMilestone | None
+    resource: RouteResource | None = None
 
 
 class OperationEvent(APIModel):
@@ -99,3 +136,7 @@ class Accrual(APIModel):
     point_id: Code
     amount_kopecks: int
     reason: str
+    payer_id: str
+    recipient_id: str
+    unit_rate_kopecks: int
+    quantity: int
